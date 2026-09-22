@@ -3,6 +3,7 @@
 #define TRANSPORT_H
 
 #include <stddef.h>
+#include <stdint.h>
 #include <sys/types.h>
 
 /* Where netlink requests go. The real transport talks to the kernel over
@@ -15,6 +16,7 @@ struct transport {
 	ssize_t (*recv)(struct transport *t, void *buf, size_t cap, int timeout_ms);
 	void (*close)(struct transport *t);
 	void *priv;
+	uint64_t seq; /* last reserved sequence; zero initially, single caller */
 };
 
 struct transport *transport_netlink_open(void);

@@ -1,8 +1,11 @@
 name: ci
 on: [push, pull_request]
+permissions:
+  contents: read
 jobs:
   test:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     strategy:
       matrix:
         cc: [gcc, clang]
@@ -12,3 +15,11 @@ jobs:
       - run: make CC=${{ matrix.cc }} asan
       - run: make CC=${{ matrix.cc }} tsan
       - run: make CC=${{ matrix.cc }} xfrm-bench && ./xfrm-bench --count 5000
+      - run: sh tests/test_cli.sh
+  real-kernel:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - run: make
+      - run: sudo unshare -n sh tests/test_real.sh

@@ -5,6 +5,8 @@
 
 #include <arpa/inet.h>
 #include <getopt.h>
+#include <errno.h>
+#include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -43,21 +45,64 @@ static int bench(const char *label, int real, unsigned service_us,
 		perror("transport");
 		return -1;
 	}
+	for (size_t i = 0; i < n; i++)
+		res[i] = SA_PENDING;
 	double t0 = now_s();
 	int failed = window <= 1 ? sa_install_sync(t, sas, n, 1000, res)
 				 : sa_install_async(t, sas, n, window, 1000, res);
 	double dt = now_s() - t0;
+	if (failed < 0)
+		perror("SA install");
+	size_t installed = 0;
+	for (size_t i = 0; i < n; i++)
+		installed += res[i] == 0;
 	printf("%-8s window=%-4u %6zu SAs  %8.3f s  %10.0f SA/s  failed=%d\n",
-	       label, window <= 1 ? 1 : window, n, dt, n / dt, failed);
+	       label, window <= 1 ? 1 : window, n, dt, (double)installed / dt, failed);
 	for (size_t i = 0; failed > 0 && i < n; i++)
 		if (res[i] != 0) {
 			printf("         first failure: SA %zu: %s\n", i, strerror(-res[i]));
 			break;
 		}
-	if (real) /* clean up what we installed */
-		sa_delete_async(t, sas, n, 64, 1000, res);
+	if (real) {
+		/* EEXIST belongs to someone else. A timeout is unknown, not proof
+		 * of ownership. Delete only requests whose success we observed. */
+		struct sa_spec *owned = calloc(n, sizeof(*owned));
+		if (!owned) {
+			perror("cleanup allocation");
+			failed = -1;
+		} else {
+			size_t count = 0;
+			for (size_t i = 0; i < n; i++)
+				if (res[i] == 0)
+					owned[count++] = sas[i];
+			int cleanup = sa_delete_async(t, owned, count, 64, 1000, res);
+			if (cleanup != 0) {
+				fprintf(stderr, "cleanup incomplete: %d; inspect the test namespace\n", cleanup);
+				failed = -1;
+			}
+			free(owned);
+		}
+		if (failed != 0)
+			fprintf(stderr, "failed/unknown installs may remain; discard the test namespace\n");
+	}
 	t->close(t);
 	return failed;
+}
+
+static int parse_uint(const char *text, unsigned long max, unsigned long *out)
+{
+	char *end;
+	if (!*text)
+		return -1;
+	for (const char *p = text; *p; p++)
+		if (*p < '0' || *p > '9')
+			return -1;
+	errno = 0;
+	unsigned long value = strtoul(text, &end, 10);
+	if (errno || *end || value > max)
+		return -1;
+	*out = value;
+	return 0;
 }
 
 int main(int argc, char **argv)
@@ -74,10 +119,16 @@ int main(int argc, char **argv)
 		{ 0, 0, 0, 0 },
 	};
 	while ((c = getopt_long(argc, argv, "n:w:s:r", opts, NULL)) != -1) {
+		unsigned long value = 0;
+		if ((c == 'n' || c == 'w' || c == 's') &&
+		    parse_uint(optarg, UINT_MAX, &value) < 0) {
+			fprintf(stderr, "invalid numeric option: %s\n", optarg);
+			return 2;
+		}
 		switch (c) {
-		case 'n': n = strtoul(optarg, NULL, 10); break;
-		case 'w': window = (unsigned)strtoul(optarg, NULL, 10); break;
-		case 's': service_us = (unsigned)strtoul(optarg, NULL, 10); break;
+		case 'n': n = value; break;
+		case 'w': window = (unsigned)value; break;
+		case 's': service_us = (unsigned)value; break;
 		case 'r': real = 1; break;
 		default:
 			fprintf(stderr, "usage: %s [--count N] [--window W] "
@@ -85,22 +136,26 @@ int main(int argc, char **argv)
 			return 2;
 		}
 	}
-	if (n == 0 || n > 60000) {
-		fprintf(stderr, "count must be 1..60000\n");
+	if (optind != argc || n == 0 || n > 60000 || window == 0 ||
+	    window > 60000 || service_us > 1000000) {
+		fprintf(stderr, "count/window must be 1..60000; service-us 0..1000000; no extra arguments\n");
 		return 2;
 	}
 
 	struct sa_spec *sas = calloc(n, sizeof(*sas));
 	int *res = calloc(n, sizeof(*res));
-	if (!sas || !res)
+	if (!sas || !res) {
+		free(sas);
+		free(res);
 		return 1;
+	}
 
 	printf("transport: %s, simulated kernel service time: %u us\n",
 	       real ? "NETLINK_XFRM (real kernel)" : "mock kernel", real ? 0 : service_us);
 	make_sas(sas, n, 0x1000);
 	int f1 = bench("sync", real, service_us, sas, n, 1, res);
-	make_sas(sas, n, 0x1000); /* fresh kernel/mock each run, same SPIs is fine */
-	int f2 = bench("async", real, service_us, sas, n, window, res);
+	make_sas(sas, n, 0x1000); /* Previous real run must have completed cleanup. */
+	int f2 = (real && f1) ? 1 : bench("async", real, service_us, sas, n, window, res);
 
 	free(sas);
 	free(res);

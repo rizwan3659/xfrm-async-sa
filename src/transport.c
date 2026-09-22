@@ -13,20 +13,37 @@
 #include <linux/netlink.h>
 #include <linux/xfrm.h>
 
+static int64_t monotonic_ms(void)
+{
+	struct timespec ts;
+	clock_gettime(CLOCK_MONOTONIC, &ts);
+	return (int64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+}
+
 static ssize_t recv_timeout(struct transport *t, void *buf, size_t cap,
 			    int timeout_ms)
 {
 	struct pollfd p = { .fd = t->fd, .events = POLLIN };
-
+	int64_t deadline = monotonic_ms() + timeout_ms;
 	for (;;) {
-		int r = poll(&p, 1, timeout_ms);
+		int64_t left = deadline - monotonic_ms();
+		int r = poll(&p, 1, left > 0 ? (int)left : 0);
 		if (r < 0 && errno == EINTR)
 			continue;
 		if (r <= 0)
 			return r;
-		ssize_t n = recv(t->fd, buf, cap, 0);
-		if (n < 0 && errno == EINTR)
+		struct iovec iov = { .iov_base = buf, .iov_len = cap };
+		struct msghdr msg = { .msg_iov = &iov, .msg_iovlen = 1 };
+		ssize_t n = recvmsg(t->fd, &msg, MSG_DONTWAIT);
+		if (n < 0 && (errno == EINTR || errno == EAGAIN)) {
+			if (monotonic_ms() >= deadline)
+				return 0;
 			continue;
+		}
+		if (n == 0 || (msg.msg_flags & MSG_TRUNC)) {
+			errno = n == 0 ? ECONNRESET : EMSGSIZE;
+			return -1;
+		}
 		return n;
 	}
 }
@@ -34,7 +51,7 @@ static ssize_t recv_timeout(struct transport *t, void *buf, size_t cap,
 static int send_all(struct transport *t, const void *buf, size_t len)
 {
 	for (;;) {
-		ssize_t n = send(t->fd, buf, len, 0);
+		ssize_t n = send(t->fd, buf, len, MSG_DONTWAIT | MSG_NOSIGNAL);
 		if (n < 0 && errno == EINTR)
 			continue;
 		return n == (ssize_t)len ? 0 : -1;
@@ -79,38 +96,49 @@ struct transport *transport_netlink_open(void)
 
 #define MOCK_SLOTS 65536 /* open-addressed set of installed (daddr, spi) */
 
+struct mock_slot {
+	uint64_t key;
+	unsigned char state; /* 0 empty, 1 occupied, 2 deleted */
+};
+
 struct mock {
 	int kfd;
 	unsigned service_us;
 	pthread_t thr;
 	unsigned long installed;
-	uint64_t *keys;
+	struct mock_slot *keys;
 };
 
 static uint64_t sa_key(uint32_t daddr, uint32_t spi)
 {
-	return ((uint64_t)daddr << 32) | spi | 1ULL << 63;
+	return ((uint64_t)daddr << 32) | spi;
 }
 
 /* Returns 1 if newly added, 0 if already present, -1 if full. */
 static int set_op(struct mock *m, uint64_t k, int del)
 {
-	size_t i = (size_t)(k * 0x9E3779B97F4A7C15ULL) % MOCK_SLOTS;
-
+	uint64_t hash = k ^ (k >> 33);
+	hash *= 0xff51afd7ed558ccdULL;
+	hash ^= hash >> 33;
+	size_t i = (size_t)hash % MOCK_SLOTS;
+	size_t available = MOCK_SLOTS;
 	for (size_t n = 0; n < MOCK_SLOTS; n++, i = (i + 1) % MOCK_SLOTS) {
-		if (m->keys[i] == k) {
+		struct mock_slot *slot = &m->keys[i];
+		if (slot->state == 1 && slot->key == k) {
 			if (del)
-				m->keys[i] = 1; /* tombstone */
+				slot->state = 2;
 			return 0;
 		}
-		if (m->keys[i] == 0) {
-			if (del)
-				return -1;
-			m->keys[i] = k;
-			return 1;
-		}
+		if (slot->state != 1 && available == MOCK_SLOTS)
+			available = i;
+		if (slot->state == 0)
+			break;
 	}
-	return -1;
+	if (del || available == MOCK_SLOTS)
+		return -1;
+	m->keys[available].key = k;
+	m->keys[available].state = 1;
+	return 1;
 }
 
 static void spin_us(unsigned us)
@@ -126,10 +154,12 @@ static void spin_us(unsigned us)
 static void *mock_kernel(void *arg)
 {
 	struct mock *m = arg;
-	char req[1024];
+	char req[1024] __attribute__((aligned(8)));
 
 	for (;;) {
 		ssize_t n = recv(m->kfd, req, sizeof(req), 0);
+		if (n < 0 && errno == EINTR)
+			continue;
 		if (n <= 0)
 			break;
 		struct nlmsghdr *nh = (struct nlmsghdr *)req;
@@ -164,7 +194,7 @@ static void *mock_kernel(void *arg)
 		ack.h.nlmsg_seq = nh->nlmsg_seq;
 		ack.e.error = err;
 		memcpy(&ack.e.msg, nh, sizeof(*nh));
-		if (send(m->kfd, &ack, ack.h.nlmsg_len, 0) < 0)
+		if (send(m->kfd, &ack, ack.h.nlmsg_len, MSG_NOSIGNAL) < 0)
 			break;
 	}
 	return NULL;
@@ -195,7 +225,7 @@ struct transport *transport_mock_open(unsigned service_us)
 
 	struct transport *t = calloc(1, sizeof(*t));
 	struct mock *m = calloc(1, sizeof(*m));
-	uint64_t *keys = calloc(MOCK_SLOTS, sizeof(*keys));
+	struct mock_slot *keys = calloc(MOCK_SLOTS, sizeof(*keys));
 	if (!t || !m || !keys)
 		goto fail;
 
@@ -207,8 +237,11 @@ struct transport *transport_mock_open(unsigned service_us)
 	t->recv = recv_timeout;
 	t->close = mock_close;
 	t->priv = m;
-	if (pthread_create(&m->thr, NULL, mock_kernel, m) != 0)
+	int err = pthread_create(&m->thr, NULL, mock_kernel, m);
+	if (err) {
+		errno = err;
 		goto fail;
+	}
 	return t;
 fail:
 	free(keys);
