@@ -93,18 +93,22 @@ size_t xfrm_build_delsa(void *buf, size_t cap, const struct sa_spec *sa,
 
 int xfrm_parse_ack(const void *buf, size_t len, uint32_t *seq, int *err)
 {
-	const struct nlmsghdr *nh = buf;
-
-	if (len < NLMSG_HDRLEN || nh->nlmsg_len < NLMSG_HDRLEN ||
-	    nh->nlmsg_len > len)
+	struct nlmsghdr nh;
+	struct nlmsgerr e;
+	if (len < sizeof(nh))
 		return -1;
-	if (nh->nlmsg_type != NLMSG_ERROR)
+	memcpy(&nh, buf, sizeof(nh));
+	if (nh.nlmsg_len < NLMSG_HDRLEN || nh.nlmsg_len > len)
+		return -1;
+	if (nh.nlmsg_type != NLMSG_ERROR)
 		return 0;
-	if (nh->nlmsg_len < NLMSG_LENGTH(sizeof(struct nlmsgerr)))
+	if (nh.nlmsg_len < NLMSG_LENGTH(sizeof(e)))
 		return -1;
-
-	const struct nlmsgerr *e = NLMSG_DATA(nh);
-	*seq = nh->nlmsg_seq;
-	*err = e->error;
+	memcpy(&e, (const char *)buf + NLMSG_HDRLEN, sizeof(e));
+	/* Positive errors are not ACKs and collide with SA_PENDING. */
+	if (e.error > 0 || e.error < -4095)
+		return -1;
+	*seq = nh.nlmsg_seq;
+	*err = e.error;
 	return 1;
 }

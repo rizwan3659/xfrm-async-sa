@@ -9,7 +9,11 @@
 
 /* results[i] receives 0 or the kernel's negative errno for sas[i], or
  * -ETIMEDOUT if no ack arrived in time. Return value: number of SAs that
- * failed, or -1 if the transport itself failed. */
+ * failed, or -1 with errno on a local/transport failure. On a mid-batch
+ * failure, SA_PENDING entries have unknown or unsent status. A timeout
+ * does not prove the kernel rejected the request. Reconcile before retry.
+ * timeout_ms must be positive and applies from each successful send.
+ * Calls on one transport must be serialized. Reopen on sequence exhaustion. */
 
 /* Baseline: send one request, block for its ack, then the next. */
 int sa_install_sync(struct transport *t, const struct sa_spec *sas, size_t n,

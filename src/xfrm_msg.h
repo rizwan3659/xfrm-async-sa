@@ -6,7 +6,8 @@
 #include <stdint.h>
 #include <netinet/in.h>
 
-/* One ESP security association, as a P-CSCF would install per UE port pair. */
+/* One unidirectional IPv4 ESP SA. A UE registration needs multiple SAs
+ * and policies; this structure does not represent a complete IMS context. */
 struct sa_spec {
 	struct in_addr src;
 	struct in_addr dst;
@@ -18,7 +19,7 @@ struct sa_spec {
 #define XFRM_MSG_BUF 512
 
 /* Build an XFRM_MSG_NEWSA request into buf. Returns the message length,
- * or 0 if buf is too small. seq is used to correlate the kernel's ack. */
+ * or 0 if buf is too small. buf must be aligned to 8 bytes. seq is used to correlate the kernel's ack. */
 size_t xfrm_build_newsa(void *buf, size_t cap, const struct sa_spec *sa,
 			uint32_t seq);
 

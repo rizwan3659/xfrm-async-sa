@@ -8,6 +8,8 @@
 #include <string.h>
 #include <linux/netlink.h>
 #include <linux/xfrm.h>
+#include <time.h>
+#include <limits.h>
 
 static int fails;
 #define CHECK(c) do { if (!(c)) { fprintf(stderr, "FAIL %s:%d: %s\n", \
@@ -24,7 +26,7 @@ static void sa(struct sa_spec *s, uint32_t spi)
 
 static void test_newsa_encoding(void)
 {
-	char buf[XFRM_MSG_BUF];
+	char buf[XFRM_MSG_BUF] __attribute__((aligned(8)));
 	struct sa_spec s;
 	sa(&s, 0xABCD);
 
@@ -122,8 +124,174 @@ static void test_partial_failure_is_per_sa(void)
 	t->close(t);
 }
 
+/* A scripted transport can deliver cases the FIFO mock cannot produce. */
+struct scripted {
+	struct transport t;
+	uint32_t sent[8];
+	unsigned sends, receives, mode;
+};
+
+static int script_send(struct transport *t, const void *buf, size_t len)
+{
+	struct scripted *s = t->priv;
+	const struct nlmsghdr *nh = buf;
+	CHECK(len >= sizeof(*nh));
+	if (s->mode == 5 && s->sends == 1 && s->receives == 0) {
+		errno = EAGAIN;
+		return -1;
+	}
+	if (s->mode == 7 && s->sends == 1) {
+		errno = EIO;
+		return -1;
+	}
+	CHECK(s->sends < 8);
+	s->sent[s->sends++] = nh->nlmsg_seq;
+	return 0;
+}
+
+static size_t write_ack(char *buf, uint32_t seq, int error)
+{
+	struct { struct nlmsghdr h; struct nlmsgerr e; } ack = {0};
+	ack.h.nlmsg_len = NLMSG_LENGTH(sizeof(ack.e));
+	ack.h.nlmsg_type = NLMSG_ERROR;
+	ack.h.nlmsg_seq = seq;
+	ack.e.error = error;
+	memcpy(buf, &ack, sizeof(ack));
+	return NLMSG_ALIGN(sizeof(ack));
+}
+
+static ssize_t script_recv(struct transport *t, void *buf, size_t cap, int timeout_ms)
+{
+	struct scripted *s = t->priv;
+	unsigned step = s->receives++;
+	CHECK(cap >= 3 * NLMSG_SPACE(sizeof(struct nlmsgerr)));
+	if (s->mode == 1 && step == 0) /* future, unsent sequence */
+		return (ssize_t)write_ack(buf, s->sent[0] + 1, -EEXIST);
+	if (s->mode == 2) { /* reversed and duplicate ACKs in one datagram */
+		size_t n = write_ack(buf, s->sent[1], -EEXIST);
+		n += write_ack((char *)buf + n, s->sent[1], -EEXIST);
+		n += write_ack((char *)buf + n, s->sent[0], 0);
+		return (ssize_t)n;
+	}
+	if (s->mode == 3 || (s->mode == 4 && step == 0)) {
+		struct timespec delay = { .tv_sec = timeout_ms / 1000,
+			.tv_nsec = (timeout_ms % 1000) * 1000000L };
+		nanosleep(&delay, NULL);
+		return 0;
+	}
+	if (s->mode == 4 && step == 1)
+		return (ssize_t)write_ack(buf, s->sent[0], -EEXIST); /* stale batch */
+	if (s->mode == 6)
+		return (ssize_t)write_ack(buf, UINT32_MAX, 0); /* endless noise */
+	return (ssize_t)write_ack(buf, s->sent[s->sends - 1], 0);
+}
+
+static void test_ack_correlation_and_timeouts(void)
+{
+	struct sa_spec specs[2];
+	int results[2];
+	sa(&specs[0], 100);
+	sa(&specs[1], 101);
+	for (unsigned mode = 1; mode <= 7; mode++) {
+		struct scripted s = { .mode = mode };
+		s.t.send = script_send;
+		s.t.recv = script_recv;
+		s.t.priv = &s;
+		unsigned window = mode == 1 ? 1 : 2;
+		int ret = sa_install_async(&s.t, specs, 2, window, 30, results);
+		if (mode == 3 || mode == 6) {
+			CHECK(ret == 2);
+			CHECK(results[0] == -ETIMEDOUT && results[1] == -ETIMEDOUT);
+		} else if (mode == 4) {
+			CHECK(results[0] == -ETIMEDOUT);
+			CHECK(sa_install_sync(&s.t, specs, 1, 100, results) == 0);
+			CHECK(s.sent[2] != s.sent[0]);
+			CHECK(results[0] == 0);
+		} else if (mode == 7) {
+			CHECK(ret == -1 && errno == EIO);
+			CHECK(results[0] == SA_PENDING && results[1] == SA_PENDING);
+		} else {
+			CHECK(ret == (mode == 2 ? 1 : 0));
+			CHECK(results[0] == 0);
+			CHECK(results[1] == (mode == 2 ? -EEXIST : 0));
+		}
+	}
+	struct scripted s = {0};
+	s.t.send = script_send;
+	s.t.recv = script_recv;
+	s.t.priv = &s;
+	s.t.seq = UINT32_MAX;
+	CHECK(sa_install_sync(&s.t, specs, 1, 10, results) == -1);
+	CHECK(errno == EOVERFLOW && s.sends == 0);
+	CHECK(sa_install_sync(&s.t, specs, 1, 0, results) == -1 && errno == EINVAL);
+}
+
+static void test_mock_key_and_reuse(void)
+{
+	struct transport *t = transport_mock_open(0);
+	CHECK(t != NULL);
+	if (!t)
+		return;
+	struct sa_spec specs[2];
+	int results[2];
+	sa(&specs[0], 1);
+	specs[1] = specs[0];
+	specs[1].dst.s_addr ^= 0x80000000u;
+	CHECK(sa_install_async(t, specs, 2, 2, 1000, results) == 0);
+	CHECK(transport_mock_installed(t) == 2);
+	CHECK(sa_delete_async(t, specs, 2, 2, 1000, results) == 0);
+	/* More unique insert/delete pairs than the table's capacity. */
+	enum { N = 1000 };
+	struct sa_spec batch[N];
+	int r[N];
+	for (unsigned round = 0; round < 70; round++) {
+		for (unsigned i = 0; i < N; i++)
+			sa(&batch[i], 100 + round * N + i);
+		CHECK(sa_install_async(t, batch, N, 64, 1000, r) == 0);
+		CHECK(sa_delete_async(t, batch, N, 64, 1000, r) == 0);
+	}
+	CHECK(transport_mock_installed(t) == 0);
+	t->close(t);
+}
+
+static void test_large_window(void)
+{
+	enum { N = 5000 };
+	struct sa_spec *specs = calloc(N, sizeof(*specs));
+	int *results = calloc(N, sizeof(*results));
+	struct transport *t = transport_mock_open(0);
+	CHECK(specs && results && t);
+	if (specs && results && t) {
+		for (unsigned i = 0; i < N; i++)
+			sa(&specs[i], 1000 + i);
+		CHECK(sa_install_async(t, specs, N, N, 5000, results) == 0);
+	}
+	if (t)
+		t->close(t);
+	free(specs);
+	free(results);
+}
+
+static void test_ack_invalid_error_and_alignment(void)
+{
+	char raw[128];
+	uint32_t seq;
+	int err;
+	size_t len = write_ack(raw + 1, 77, -EINVAL);
+	CHECK(xfrm_parse_ack(raw + 1, len, &seq, &err) == 1);
+	CHECK(seq == 77 && err == -EINVAL);
+	len = write_ack(raw + 1, 77, 1);
+	CHECK(xfrm_parse_ack(raw + 1, len, &seq, &err) == -1);
+	len = write_ack(raw + 1, 77, INT_MIN);
+	CHECK(xfrm_parse_ack(raw + 1, len, &seq, &err) == -1);
+}
+
 int main(void)
 {
+	test_ack_correlation_and_timeouts();
+	test_mock_key_and_reuse();
+	test_large_window();
+	test_ack_invalid_error_and_alignment();
 	test_newsa_encoding();
 	test_ack_parsing();
 	test_sync_and_async_agree();
