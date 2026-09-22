@@ -1,0 +1,14 @@
+name: ci
+on: [push, pull_request]
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        cc: [gcc, clang]
+    steps:
+      - uses: actions/checkout@v4
+      - run: make CC=${{ matrix.cc }} test
+      - run: make CC=${{ matrix.cc }} asan
+      - run: make CC=${{ matrix.cc }} tsan
+      - run: make CC=${{ matrix.cc }} xfrm-bench && ./xfrm-bench --count 5000
