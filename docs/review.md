@@ -40,7 +40,10 @@ GitHub Actions, not locally. The initial code validation at `127818d` passed:
   using `sudo unshare -n sh tests/test_real.sh`.
 
 [Initial passing run](https://github.com/rizwan3659/xfrm-async-sa/actions/runs/35706266027).
-The branch workflow repeats these checks for subsequent commits.
+The final code validation at `f17ef11` also passed all three jobs:
+[final code validation](https://github.com/rizwan3659/xfrm-async-sa/actions/runs/35708058785).
+This includes the warning cleanups after the first run. The remaining
+packaging changes add the printable PDF and documentation links only.
 
 The scripted transport specifically tests out-of-order, duplicate, packed,
 unknown, unsent and stale ACKs, missing ACKs, endless unrelated ACKs, EAGAIN,

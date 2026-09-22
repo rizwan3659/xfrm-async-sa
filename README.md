@@ -67,7 +67,8 @@ namespace is destroyed. Cleanup failures cause a nonzero exit status.
 
 ## Study guide
 
-Read [the complete walkthrough](docs/study-guide.md) for XFRM fundamentals,
+Read [the printable 17-page PDF](docs/xfrm-study-guide.pdf) or
+[the complete Markdown walkthrough](docs/study-guide.md) for XFRM fundamentals,
 wire layouts, scheduling invariants, error recovery, laboratory exercises,
 and interview questions. [The review](docs/review.md) lists fixes and limits.
 This is userspace Linux C using a kernel API, not a kernel module.
