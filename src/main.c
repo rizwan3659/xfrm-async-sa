@@ -16,7 +16,7 @@ static double now_s(void)
 {
 	struct timespec t;
 	clock_gettime(CLOCK_MONOTONIC, &t);
-	return t.tv_sec + t.tv_nsec / 1e9;
+	return (double)t.tv_sec + (double)t.tv_nsec / 1e9;
 }
 
 static void make_sas(struct sa_spec *sas, size_t n, uint32_t spi_base)

@@ -32,7 +32,7 @@ static int drain_acks(struct transport *t, int timeout_ms, uint32_t base,
 	}
 	int got = 0;
 	int left = (int)len;
-	for (struct nlmsghdr *nh = (struct nlmsghdr *)buf; NLMSG_OK(nh, left);
+	for (struct nlmsghdr *nh = (struct nlmsghdr *)buf; left >= 0 && NLMSG_OK(nh, (unsigned int)left);
 	     nh = NLMSG_NEXT(nh, left)) {
 		uint32_t seq;
 		int err;
